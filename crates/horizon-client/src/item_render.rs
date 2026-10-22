@@ -227,6 +227,8 @@ fn submit_quads(
         FoilType::Special => Foil::Special,
     };
     let _ = display;
+    // `transform_normal`'s normal matrix, the same for every quad.
+    let normal_matrix = Mat3::from_mat4(m).inverse().transpose();
     for q in &baked.quads {
         let Some(r) = sprites
             .get(sprite_name(&q.material.sprite))
@@ -253,7 +255,7 @@ fn submit_quads(
         sink.quad(ItemQuad {
             pos,
             uv,
-            normal: transform_normal(m, direction_vector(q.facing)),
+            normal: (normal_matrix * direction_vector(q.facing)).normalize_or_zero(),
             color: argb(color),
             foil,
             light_emission: q.light_emission,

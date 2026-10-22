@@ -514,6 +514,17 @@ impl ItemModelNode {
             _ => return Err(err("unknown item model type")),
         })
     }
+    /// Whether resolving the node reads only the stack, not the owner,
+    /// level, seed or display: plain and composite models whose tints don't
+    /// come from the owner's team.
+    pub fn reads_only_stack(&self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Model(leaf) => !leaf.tints.iter().any(|t| matches!(t, TintSource::Team(_))),
+            Self::Composite { models, .. } => models.iter().all(Self::reads_only_stack),
+            _ => false,
+        }
+    }
     /// Every model resource id the tree can ask for.
     pub fn dependencies(&self, out: &mut Vec<String>) {
         match self {
@@ -1079,6 +1090,17 @@ impl ItemModels {
             Some(d) => state.node(out, &d.model, &Mat4::IDENTITY),
             None => state.missing(out, &Mat4::IDENTITY),
         }
+    }
+    /// Whether `resolve` gives this stack the same layers in every context.
+    pub fn reads_only_stack(&self, stack: &StackView) -> bool {
+        let components = self.components(stack);
+        let Some(Value::String(model_id)) = components.get("minecraft:item_model") else {
+            return true;
+        };
+        let id = identifier(model_id).unwrap_or_else(|_| model_id.clone());
+        self.definitions
+            .get(&id)
+            .is_none_or(|d| d.model.reads_only_stack())
     }
     /// `ItemModelResolver.shouldPlaySwapAnimation`.
     pub fn hand_animation_on_swap(&self, stack: &StackView) -> bool {

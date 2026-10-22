@@ -389,6 +389,7 @@ impl Game<'_> {
                 .player
                 .as_ref()
                 .map(|p| ([p.position.x, p.position.y, p.position.z], p.velocity.y)),
+            open_bricks: Default::default(),
         };
         self.particles.tick(&level);
         self.tick_pickups();

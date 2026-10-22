@@ -18,3 +18,28 @@ fn display_context_names_round_trip() {
         assert_eq!(DisplayContext::by_name(name).unwrap().name(), name);
     }
 }
+
+#[test]
+fn plain_models_read_only_the_stack() {
+    let node = |v: Value| ItemModelNode::decode(&v).unwrap().reads_only_stack();
+    let leaf = |tint: &str| {
+        serde_json::json!({
+            "type": "minecraft:model",
+            "model": "minecraft:item/leather_helmet",
+            "tints": [{"type": tint, "default": 0}],
+        })
+    };
+    assert!(node(leaf("minecraft:dye")));
+    assert!(node(serde_json::json!({
+        "type": "minecraft:composite",
+        "models": [leaf("minecraft:dye"), {"type": "minecraft:empty"}],
+    })));
+    // The owner's team colour, and choices made by the owner or the level.
+    assert!(!node(leaf("minecraft:team")));
+    assert!(!node(serde_json::json!({
+        "type": "minecraft:condition",
+        "property": "minecraft:using_item",
+        "on_true": leaf("minecraft:dye"),
+        "on_false": leaf("minecraft:dye"),
+    })));
+}

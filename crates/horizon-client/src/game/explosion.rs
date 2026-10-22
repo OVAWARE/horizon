@@ -171,6 +171,7 @@ impl Game<'_> {
             (level.min_y(), level.max_y())
         });
         let mut set: JavaHashMap<Key, ()> = JavaHashMap::default();
+        let mut cache = BlastCache::new(center, radius);
         for xx in 0..16 {
             for yy in 0..16 {
                 for zz in 0..16 {
@@ -195,24 +196,28 @@ impl Game<'_> {
                         {
                             break;
                         }
-                        let state = self.world.block(pos[0], pos[1], pos[2]);
-                        let f = self.res.facts().get(state);
-                        let fluid = if f.fluid != Fluid::None {
-                            100.0f32
-                        } else {
-                            0.0
+                        let slot = cache.slot(pos);
+                        power -= match slot.map(|i| cache.cost[i]) {
+                            Some(cost) if !cost.is_nan() => cost,
+                            _ => {
+                                let cost = self.explosion_step_cost(pos, resists);
+                                if let Some(i) = slot {
+                                    cache.cost[i] = cost;
+                                }
+                                cost
+                            }
                         };
-                        match resists {
-                            Some((at, resistance)) if at == pos => {
-                                power -= (resistance + 0.3) * 0.3;
-                            }
-                            _ if !self.res.facts().is_air(state) || f.fluid != Fluid::None => {
-                                power -= (f.explosion_resistance.max(fluid) + 0.3) * 0.3;
-                            }
-                            _ => {}
-                        }
                         if power > 0.0 {
-                            set.put(Key(pos), ());
+                            // Adding a key again leaves a HashMap as it was.
+                            match slot {
+                                Some(i) if cache.added[i] => {}
+                                _ => {
+                                    set.put(Key(pos), ());
+                                    if let Some(i) = slot {
+                                        cache.added[i] = true;
+                                    }
+                                }
+                            }
                         }
                         xp += xd * f64::from(0.3f32);
                         yp += yd * f64::from(0.3f32);
@@ -223,6 +228,23 @@ impl Game<'_> {
             }
         }
         set.entries().map(|(k, _)| k.0).collect()
+    }
+    /// The power a ray loses to the block at `pos` on each step through it.
+    fn explosion_step_cost(&self, pos: [i32; 3], resists: Option<([i32; 3], f32)>) -> f32 {
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let f = self.res.facts().get(state);
+        let fluid = if f.fluid != Fluid::None {
+            100.0f32
+        } else {
+            0.0
+        };
+        match resists {
+            Some((at, resistance)) if at == pos => (resistance + 0.3) * 0.3,
+            _ if !self.res.facts().is_air(state) || f.fluid != Fluid::None => {
+                (f.explosion_resistance.max(fluid) + 0.3) * 0.3
+            }
+            _ => 0.0,
+        }
     }
     /// `ServerExplosion.hurtEntities` (player, mobs, items, primed TNT);
     /// the player takes `damage_type`.
@@ -440,8 +462,12 @@ impl Game<'_> {
         // Explosion.explode: the blast is heard.
         let ctx = horizon_client::sculk::Context::default();
         self.post_game_event("minecraft:explode", center, ctx);
-        let mut targets = self.exploded_positions(center, radius, resists);
-        self.explosion_hurt_entities(center, radius, damage_type);
+        let mut targets = horizon_client::spans::time("explode_positions", || {
+            self.exploded_positions(center, radius, resists)
+        });
+        horizon_client::spans::time("explode_entities", || {
+            self.explosion_hurt_entities(center, radius, damage_type)
+        });
         if interaction != BlockInteraction::Keep {
             // Util.shuffle(list, level.random)
             for i in (2..=targets.len()).rev() {
@@ -449,9 +475,12 @@ impl Game<'_> {
                 targets.swap(i - 1, swap);
             }
             let mut stacks: Vec<([i32; 3], ItemStack)> = Vec::new();
-            for &pos in &targets {
-                self.explosion_hit_block(pos, radius, interaction, &mut stacks)?;
-            }
+            horizon_client::spans::time("explode_blocks", || {
+                for &pos in &targets {
+                    self.explosion_hit_block(pos, radius, interaction, &mut stacks)?;
+                }
+                Result::Ok(())
+            })?;
             for (pos, stack) in stacks {
                 self.pop_resource(pos, stack);
             }
@@ -552,6 +581,46 @@ impl Game<'_> {
     }
 }
 
+/// The blocks around an explosion its rays can reach: each block's cost is
+/// looked up once rather than on every ray step through it (about 25,000
+/// steps for a TNT blast), and its key is added to the set once.
+struct BlastCache {
+    origin: [i32; 3],
+    size: usize,
+    /// NaN until looked up.
+    cost: Vec<f32>,
+    added: Vec<bool>,
+}
+impl BlastCache {
+    /// A ray starts with at most 1.3 x radius power and loses at least
+    /// 0.225 of it per 0.3 step; blocks beyond the cube (huge blasts) are
+    /// looked up as they come.
+    fn new(center: [f64; 3], radius: f32) -> Self {
+        let reach = (f64::from(radius) * 1.3 / 0.225 * 0.3)
+            .ceil()
+            .clamp(0.0, 16.0) as i32
+            + 1;
+        let size = (2 * reach + 1) as usize;
+        Self {
+            origin: center.map(|c| c.floor() as i32 - reach),
+            size,
+            cost: vec![f32::NAN; size * size * size],
+            added: vec![false; size * size * size],
+        }
+    }
+    fn slot(&self, pos: [i32; 3]) -> Option<usize> {
+        let mut index = 0;
+        for axis in 0..3 {
+            let d = usize::try_from(pos[axis].wrapping_sub(self.origin[axis])).ok()?;
+            if d >= self.size {
+                return None;
+            }
+            index = index * self.size + d;
+        }
+        Some(index)
+    }
+}
+
 /// `ServerExplosion.addOrAppendStack` with `ItemEntity.merge(.., 16)`.
 fn add_or_append_stack(
     stacks: &mut Vec<([i32; 3], ItemStack)>,
@@ -588,6 +657,18 @@ mod tests {
             Key([1, 0, 2]).comparable_compare(&Key([0, 0, 3])),
             Some(Ordering::Less)
         );
+    }
+
+    #[test]
+    fn blast_cache_holds_every_block_a_tnt_ray_reaches() {
+        // At most 1.3 x 4 power, losing 0.225 per 0.3 step: under 7 blocks.
+        let cache = BlastCache::new([0.5, 64.0, 0.5], 4.0);
+        for pos in [[7, 64, 0], [-7, 57, -7], [7, 71, 7]] {
+            assert!(cache.slot(pos).is_some(), "{pos:?}");
+        }
+        assert_eq!(cache.slot([100, 64, 0]), None);
+        assert_eq!(cache.slot([0, -100, 0]), None);
+        assert_ne!(cache.slot([1, 64, 0]), cache.slot([0, 65, 0]));
     }
 
     #[test]

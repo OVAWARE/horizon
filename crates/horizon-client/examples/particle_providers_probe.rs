@@ -178,6 +178,7 @@ fn main() -> Result<()> {
             facts: &facts,
             collision: &collision,
             player: None,
+            open_bricks: Default::default(),
         };
         let v = |key: &str| -> [f64; 3] {
             std::array::from_fn(|i| case[key][i].as_f64().unwrap_or(0.0))

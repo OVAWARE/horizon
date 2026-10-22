@@ -8,6 +8,7 @@
 use crate::{
     blocks::{BlockFacts, Fluid},
     collisions::SceneCollisions,
+    fast_hash::FxHashMap,
     hud::Rect,
     mesher::Vertex,
     world::World,
@@ -15,10 +16,11 @@ use crate::{
 use glam::{DVec3, Quat, Vec3 as FVec3};
 use horizon_core::{
     geometry::{Aabb, Axis, Vec3, trig},
+    position::BlockPos,
     random::{LegacyRandom, RandomSource},
 };
 use horizon_world::block_collision::BlockCollisionRegistry;
-use std::{collections::HashMap, path::Path};
+use std::{cell::RefCell, collections::HashMap, path::Path};
 
 macro_rules! particle_types {
     ($($variant:ident = $name:literal),* $(,)?) => {
@@ -1065,9 +1067,21 @@ pub struct ParticleLevel<'a> {
     pub collision: &'a BlockCollisionRegistry<'a>,
     /// Local player feet position and vertical velocity (`PlayerCloudParticle`).
     pub player: Option<([f64; 3], f64)>,
+    /// 4x4x4 bricks known to hold no collision shape, for the level as it is
+    /// during one tick (particles change no blocks).
+    pub open_bricks: OpenBricks,
 }
+/// Which 4x4x4 bricks have no block with a collision shape, filled lazily.
+#[derive(Default)]
+pub struct OpenBricks(RefCell<FxHashMap<(i32, i32, i32), bool>>);
 impl ParticleLevel<'_> {
     fn collide(&self, bb: Aabb, d: [f64; 3]) -> [f64; 3] {
+        // A swept box in open air: no colliders, and `collideBoundingBox`
+        // returns the movement as it is. Smoke from big explosions is
+        // thousands of particles, nearly all of them here.
+        if self.open_air(bb.expand_towards(Vec3::new(d[0], d[1], d[2]))) {
+            return d;
+        }
         let mut scene = SceneCollisions {
             world: self.world,
             binding: self.collision,
@@ -1077,6 +1091,52 @@ impl ParticleLevel<'_> {
             Ok(v) => [v.x, v.y, v.z],
             Err(_) => d,
         }
+    }
+    /// Whether every block `BlockCollisions` visits for `bounds` (one
+    /// beyond it on each side) has an empty collision shape or no chunk.
+    fn open_air(&self, bounds: Aabb) -> bool {
+        let (min, max) = (bounds.min_position(), bounds.max_position());
+        if !min.is_finite() || !max.is_finite() {
+            return false;
+        }
+        let start = BlockPos::containing(Vec3::new(min.x - 1.0e-7, min.y - 1.0e-7, min.z - 1.0e-7))
+            .offset(-1, -1, -1);
+        let end = BlockPos::containing(Vec3::new(max.x + 1.0e-7, max.y + 1.0e-7, max.z + 1.0e-7))
+            .offset(1, 1, 1);
+        // Long moves go through the scan.
+        let short = |a: i32, b: i32| (0..=8).contains(&b.wrapping_sub(a));
+        if !short(start.x, end.x) || !short(start.y, end.y) || !short(start.z, end.z) {
+            return false;
+        }
+        let mut bricks = self.open_bricks.0.borrow_mut();
+        for bx in start.x >> 2..=end.x >> 2 {
+            for by in start.y >> 2..=end.y >> 2 {
+                for bz in start.z >> 2..=end.z >> 2 {
+                    let open = *bricks
+                        .entry((bx, by, bz))
+                        .or_insert_with(|| self.brick_open(bx, by, bz));
+                    if !open {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+    fn brick_open(&self, bx: i32, by: i32, bz: i32) -> bool {
+        let Some(chunk) = self.world.chunks.get(&(bx >> 2, bz >> 2)) else {
+            // The scan skips blocks of chunks that aren't loaded.
+            return true;
+        };
+        (by * 4..by * 4 + 4).all(|y| {
+            (bz * 4..bz * 4 + 4).all(|z| {
+                (bx * 4..bx * 4 + 4).all(|x| {
+                    self.collision
+                        .collision_block(chunk.block(x, y, z))
+                        .is_ok_and(|b| b.empty_shape)
+                })
+            })
+        })
     }
     fn block_at(p: [f64; 3]) -> [i32; 3] {
         [

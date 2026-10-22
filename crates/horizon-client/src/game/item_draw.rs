@@ -329,6 +329,9 @@ impl Game<'_> {
             }
             _ => None,
         });
+        // Most models read only the stack: those resolve once a frame per
+        // kind of stack rather than once per item (an explosion drops hundreds).
+        let mut shared: Vec<(&ItemStack, ItemRenderState)> = Vec::new();
         for (item, at, partial) in live.chain(taken) {
             let entity_start = out.len();
             let q = item.position;
@@ -336,14 +339,31 @@ impl Game<'_> {
             if pos.length_squared() > 64.0 * 64.0 {
                 continue;
             }
-            // `extractItemGroupRenderState`: GROUND, seeded by the entity id.
-            let owner = owner_at([q.x, q.y, q.z], 0.0, "minecraft:item");
-            let state = self.resolve_item(
-                &item.stack,
-                DisplayContext::Ground,
-                Some(&owner),
-                item.id as i32,
-            );
+            let resolved;
+            let state = match shared
+                .iter()
+                .position(|(s, _)| same_model_inputs(s, &item.stack))
+            {
+                Some(i) => &shared[i].1,
+                None => {
+                    // `extractItemGroupRenderState`: GROUND, seeded by the entity id.
+                    let owner = owner_at([q.x, q.y, q.z], 0.0, "minecraft:item");
+                    let state = self.resolve_item(
+                        &item.stack,
+                        DisplayContext::Ground,
+                        Some(&owner),
+                        item.id as i32,
+                    );
+                    let models = &self.pack.item_renderer.models;
+                    if models.reads_only_stack(&item_render::stack_view(&item.stack)) {
+                        shared.push((&item.stack, state));
+                        &shared[shared.len() - 1].1
+                    } else {
+                        resolved = state;
+                        &resolved
+                    }
+                }
+            };
             if state.is_empty() {
                 continue;
             }
@@ -363,16 +383,21 @@ impl Game<'_> {
             let seed = i64::from(self.pack.item_renderer.item_id(&item.stack.item))
                 + i64::from(item.stack.damage);
             for copy in item_render::cluster_poses(
-                &state,
+                state,
                 pose,
                 item_render::rendered_amount(item.stack.count),
                 seed,
             ) {
-                self.submit_item_world(&state, copy, vertex_light(packed), out);
+                self.submit_item_world(state, copy, vertex_light(packed), out);
             }
             self.cull_entity_vertices(out, entity_start);
         }
     }
+}
+/// Stacks whose models resolve alike when their models read only the stack
+/// (the count matters only to models that read it).
+fn same_model_inputs(a: &ItemStack, b: &ItemStack) -> bool {
+    a.item == b.item && a.damage == b.damage && a.extra == b.extra && (a.count > 0) == (b.count > 0)
 }
 
 #[cfg(test)]
