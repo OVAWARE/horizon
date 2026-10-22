@@ -77,6 +77,15 @@ impl Arena {
         };
         Self::with_usage(device, 4, capacity, usage)
     }
+    /// Records a vertex shader reads from storage: pages no larger than one
+    /// storage binding.
+    pub fn storage(device: &wgpu::Device, stride: u64, capacity: u64) -> Self {
+        let mut arena = Self::with_usage(device, stride, capacity, wgpu::BufferUsages::STORAGE);
+        let bytes = device.limits().max_storage_buffer_binding_size;
+        arena.page_limit = arena.page_limit.min((bytes / stride) / GRAIN * GRAIN);
+        arena.initial_capacity = arena.initial_capacity.min(arena.page_limit);
+        arena
+    }
     fn with_usage(
         device: &wgpu::Device,
         stride: u64,

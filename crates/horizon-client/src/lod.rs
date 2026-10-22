@@ -4,11 +4,12 @@ use crate::{
     blocks::BlockFacts,
     chunk::{Chunk, MIN_Y},
     fast_hash::{FxHashMap, FxHashSet},
-    mesher::SectionMesh,
     streaming::{LodSource, WorkerContext},
 };
 mod mesh;
+pub mod quads;
 use horizon_world::registry::BlockStateId;
+use quads::FarMesh;
 use std::{
     collections::VecDeque,
     sync::{
@@ -489,7 +490,7 @@ enum Done {
     },
     Mesh {
         active: FxHashSet<TileKey>,
-        meshes: Vec<(TileKey, SectionMesh)>,
+        meshes: Vec<(TileKey, FarMesh)>,
         covered: FxHashSet<(i32, i32)>,
     },
 }
@@ -1002,7 +1003,7 @@ impl Lod {
         detail: i32,
         distance: u32,
         covered: Option<FxHashSet<(i32, i32)>>,
-    ) -> Vec<(TileKey, SectionMesh)> {
+    ) -> Vec<(TileKey, FarMesh)> {
         let elevation =
             (((camera[1] - f64::from(MIN_Y + crate::chunk::HEIGHT)).clamp(0., 16384.)) as i32 / 32)
                 * 32;
@@ -1045,7 +1046,7 @@ impl Lod {
         });
         meshes
     }
-    fn receive(&mut self, meshes: &mut Vec<(TileKey, SectionMesh)>) {
+    fn receive(&mut self, meshes: &mut Vec<(TileKey, FarMesh)>) {
         while let Ok(done) = self.results.try_recv() {
             match done {
                 Done::Detail(key, columns) => {
@@ -1300,20 +1301,22 @@ impl Lod {
         }
     }
     #[cfg(test)]
-    fn mesh(&self, key: TileKey) -> SectionMesh {
+    fn mesh(&self, key: TileKey) -> crate::mesher::SectionMesh {
         let finer = Self::finer(&self.active, &[key].into_iter().collect())
             .remove(&key)
             .unwrap_or_default();
         let input = self.snapshot().mesh_input(key, finer);
-        mesh::Mesher::default().mesh(
-            key,
-            &input.columns(),
-            &self.covered,
-            self.covered_bounds,
-            &self.context,
-            &input.neighbors,
-            &input.finer,
-        )
+        mesh::Mesher::default()
+            .mesh(
+                key,
+                &input.columns(),
+                &self.covered,
+                self.covered_bounds,
+                &self.context,
+                &input.neighbors,
+                &input.finer,
+            )
+            .section()
     }
 }
 impl Snapshot {

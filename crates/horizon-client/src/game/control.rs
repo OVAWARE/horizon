@@ -764,6 +764,9 @@ impl Game<'_> {
                 "culled_sections": r.culled_sections(),
                 "uploaded_bytes": r.uploaded_bytes,
                 "resident_sections": r.resident_sections(),
+                "lod_levels": r.lod_levels().into_iter().map(|(level, tiles, solid, translucent)| json!({
+                    "level": level, "tiles": tiles, "solid_quads": solid, "translucent_quads": translucent,
+                })).collect::<Vec<_>>(),
                 "arena_bytes": arena_bytes,
                 "section_vertex_bytes": section_vertex_bytes,
                 "gpu_allocated_bytes": memory.as_ref().map(|m| m.total_allocated_bytes),

@@ -387,6 +387,8 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     sections: resident::Resident<SectionGpu>,
     lods: HashMap<crate::lod::TileKey, lod::Tile>,
+    /// Far tiles' face records, pipelines and draws.
+    far: lod::Far,
     /// The chunk columns the resident tiles leave out (`Lod::take_cutout`):
     /// their sections are drawn even past the render distance, so terrain
     /// leaving it never opens a hole before the tiles fill it in.
@@ -857,10 +859,17 @@ impl Renderer {
         let vertices: u64 = self
             .sections
             .values()
-            .chain(self.lods.values().map(|tile| &tile.mesh))
             .map(|s| u64::from(s.solid + s.translucent) * 4)
             .sum();
-        [self.arena.bytes(), vertices * stride]
+        let quads: u64 = self
+            .lods
+            .values()
+            .map(|tile| u64::from(tile.solid + tile.translucent))
+            .sum();
+        [
+            self.arena.bytes() + self.far.bytes(),
+            vertices * stride + quads * std::mem::size_of::<crate::lod::quads::FarQuad>() as u64,
+        ]
     }
 }
 impl Renderer {
@@ -1997,6 +2006,24 @@ impl Renderer {
             1 << 20,
         );
         // Sections as one index list per frame where multi-draw is emulated.
+        let far = lod::Far::new(
+            &device,
+            &bindings,
+            |layout, label, fragment, buffers, blend| {
+                pipeline_in(
+                    layout,
+                    label,
+                    "vs_far",
+                    fragment,
+                    buffers,
+                    tri,
+                    Some(wgpu::Face::Back),
+                    true,
+                    true,
+                    blend,
+                )
+            },
+        );
         let flat = flat::wanted(&adapter, &device).then(|| {
             let buffers = [Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<TerrainVertex>() as u64,
@@ -2150,6 +2177,7 @@ impl Renderer {
             depth,
             sections: resident::Resident::default(),
             lods: HashMap::new(),
+            far,
             lod_cutout: Default::default(),
             lod_retiring: Default::default(),
             lod_pending: None,
@@ -2529,6 +2557,7 @@ impl Renderer {
         self.block_entity_revision = next_block_entity_revision();
         self.sections.clear();
         self.lods.clear();
+        self.far.clear();
         self.lod_cutout.clear();
         self.lod_retiring.clear();
         self.lod_pending = None;
@@ -3066,16 +3095,20 @@ impl Renderer {
                 None => {}
             }
         }
-        // Distant terrain tiles are never occlusion tested: phase 1.
-        for (i, v) in visible_lods.iter().enumerate() {
-            let s = &self.lods[&v.key].mesh;
-            s.faces.ranges(eye - Vec3::from(v.origin), |first, quads| {
-                let first = s.start + u64::from(first) * 4;
-                self.draws
-                    .push([quads * 6, 1, 0, first as u32, (visible.len() + i) as u32]);
-                self.draw_pages.push((s.page, None));
-            });
-        }
+        // Distant terrain tiles have their own draws (`lod::Far`), after
+        // the near terrain's and never occlusion tested.
+        crate::spans::time("far_draws", || {
+            self.far.prepare(
+                &self.device,
+                &mut self.uploads,
+                &mut encoder,
+                &self.lods,
+                &visible_lods,
+                visible.len(),
+                eye,
+                self.multi_draw,
+            )
+        });
         let phase1_draws = self.draws.len() as u32;
         self.draws.extend_from_slice(&self.phase2_draws);
         self.draw_pages.extend_from_slice(&self.phase2_pages);
@@ -3084,7 +3117,7 @@ impl Renderer {
         // LevelRenderer: nearby sections each frame, plus a rotating eighth
         // (at least 15) of the visible list. Cached views avoid needless sorts.
         self.translucent_draws.clear();
-        let count = visible.len() + visible_lods.len();
+        let count = visible.len();
         let budget = (count / 8).max(15).min(count);
         self.translucency_cursor %= count.max(1);
         for (i, v) in visible.iter().enumerate().rev() {
@@ -3126,56 +3159,13 @@ impl Renderer {
                 ));
             }
         }
-        // Sections went back to front (`visible` is sorted by distance, then
-        // key): tiles' water only needs sorting in when there is some.
-        let section_translucent = self.translucent_draws.len();
-        for (i, v) in visible_lods.iter().enumerate() {
-            let instance = visible.len() + i;
-            let tile = self.lods.get_mut(&v.key).expect("visible resident tile");
-            let s = &mut tile.mesh;
-            if let Some((index_page, index_start)) = s.sorted_indices {
-                let scheduled = (instance + count - self.translucency_cursor) % count < budget;
-                if (!s.sort.is_sorted() || scheduled)
-                    && let Some(indices) = s.sort.update_lod(
-                        camera.to_array(),
-                        v.key.origin(),
-                        &mut self.translucent_sorter,
-                    )
-                {
-                    self.uploads.buffer(
-                        &mut encoder,
-                        self.sorted_indices.buffer(index_page),
-                        index_start * 4,
-                        bytemuck::cast_slice(indices),
-                    );
-                }
-                let first = s.start + u64::from(s.solid) * 4;
-                self.translucent_draws.push((
-                    v.distance,
-                    instance,
-                    [
-                        s.translucent * 6,
-                        1,
-                        index_start as u32,
-                        first as u32,
-                        instance as u32,
-                    ],
-                    (s.page, Some(index_page)),
-                ));
-            }
-        }
-        // Near water and distant water share one back-to-front draw order.
-        if self.translucent_draws.len() > section_translucent {
-            self.translucent_draws
-                .sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-        }
         for &(_, _, draw, pages) in &self.translucent_draws {
             self.draws.push(draw);
             self.draw_pages.push(pages);
         }
         self.translucency_cursor += budget;
         let translucent_draws = self.draws.len() as u32 - solid_draws;
-        self.section_draws = self.draws.len();
+        self.section_draws = self.draws.len() + self.far.draws();
         // Metal replays a multi-draw as one draw call per entry.
         self.section_draw_calls = if self.multi_draw && self.info.backend != wgpu::Backend::Metal {
             (0..self.draws.len())
@@ -3372,7 +3362,6 @@ impl Renderer {
                 if self.flat_on && !self.draws.is_empty() && self.draws.len() >= flat.min_draws =>
             {
                 let sections = &self.sections;
-                let lods = &self.lods;
                 let sorted = &self.sorted_indices;
                 crate::spans::time("flatten", || {
                     flat.prepare(
@@ -3382,16 +3371,10 @@ impl Renderer {
                         &self.draws,
                         &self.draw_pages,
                         solid_draws as usize,
-                        visible
-                            .iter()
-                            .filter_map(|v| {
-                                let id = sections.get(v.slot).flat_id?;
-                                Some((id, section_instance(v.origin)))
-                            })
-                            .chain(visible_lods.iter().filter_map(|v| {
-                                let id = lods[&v.key].mesh.flat_id?;
-                                Some((id, lod::instance(v.origin)))
-                            })),
+                        visible.iter().filter_map(|v| {
+                            let id = sections.get(v.slot).flat_id?;
+                            Some((id, section_instance(v.origin)))
+                        }),
                         |page| sorted.buffer(page).clone(),
                     )
                 })
@@ -3583,6 +3566,9 @@ impl Renderer {
                     }
                 }
             }
+            // Far terrain behind the near terrain, which hides much of it.
+            self.far
+                .draw(&mut pass, &self.instances, false, self.multi_draw);
             if entity_quads > 0 {
                 pass.set_pipeline(&self.entity_pipeline);
                 pass.set_bind_group(0, &self.entity_group, &[]);
@@ -3632,6 +3618,9 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.debug_line_buffer.slice(..));
                 pass.draw(0..4, debug_depth..debug_depth + debug_top);
             }
+            // Far water before the near water in front of it.
+            self.far
+                .draw(&mut pass, &self.instances, true, self.multi_draw);
             match self.flat.as_ref().filter(|_| flat_frame) {
                 Some(flat) => {
                     pass.set_pipeline(&flat.translucent);

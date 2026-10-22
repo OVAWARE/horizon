@@ -47,6 +47,47 @@ impl FaceGroups {
         group(solid)
     }
 
+    /// Group axis-aligned records whose facing is known: `facing` gives the
+    /// axis (0 x, 1 y, 2 z), whether the quad faces its positive side, and
+    /// its plane. Keeps the order of quads within a group, as `group` does.
+    pub fn group_by<T: Copy>(
+        quads: &mut Vec<T>,
+        facing: impl Fn(&T) -> (usize, bool, f32),
+    ) -> Self {
+        let mut groups = Self::default();
+        for (g, plane) in groups.planes.iter_mut().enumerate() {
+            if g != UNALIGNED {
+                *plane = if axis(g).1 { f32::MAX } else { f32::MIN };
+            }
+        }
+        let faces: Vec<u8> = quads
+            .iter()
+            .map(|quad| {
+                let (axis_index, positive, plane) = facing(quad);
+                let negative = NEGATIVE[axis_index];
+                let g = if positive {
+                    GROUPS - 1 - negative
+                } else {
+                    negative
+                };
+                groups.quads[g] += 1;
+                let nearest = &mut groups.planes[g];
+                *nearest = if positive {
+                    nearest.min(plane)
+                } else {
+                    nearest.max(plane)
+                };
+                g as u8
+            })
+            .collect();
+        if !faces.windows(2).all(|w| w[0] <= w[1]) {
+            let mut order: Vec<usize> = (0..quads.len()).collect();
+            order.sort_by_key(|&i| faces[i]);
+            *quads = order.into_iter().map(|i| quads[i]).collect();
+        }
+        groups
+    }
+
     /// Whether group `g` can hold a front-facing quad for an eye at `eye`,
     /// relative to the section's minimum corner.
     pub fn visible(&self, g: usize, eye: Vec3) -> bool {

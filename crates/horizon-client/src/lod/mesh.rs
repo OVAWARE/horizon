@@ -1,8 +1,11 @@
 //! Exposed voxel-column faces, merged without changing their block-scale UVs.
-use super::{Column, Span, TileKey};
+use super::{
+    Column, Span, TileKey,
+    quads::{FarMesh, FarQuad, MAX_FACE},
+};
 use crate::{
     fast_hash::{FxHashMap, FxHashSet},
-    mesher::{FaceGroups, OPAQUE_LAYER, SectionMesh, TerrainVertex},
+    mesher::OPAQUE_LAYER,
     streaming::WorkerContext,
 };
 use horizon_assets::model::Direction;
@@ -66,7 +69,7 @@ impl Mesher {
         context: &WorkerContext,
         neighbors: &[Vec<EdgeColumn>; 4],
         finer: &[TileKey],
-    ) -> SectionMesh {
+    ) -> FarMesh {
         mesh_columns_with_edges(
             key,
             columns,
@@ -257,7 +260,7 @@ fn mesh_columns(
     covered: &FxHashSet<(i32, i32)>,
     covered_bounds: Option<[i32; 4]>,
     material: impl FnMut(&Span, Direction) -> Material,
-) -> SectionMesh {
+) -> crate::mesher::SectionMesh {
     mesh_columns_with_neighbors(key, columns, covered, covered_bounds, &[], material)
 }
 #[cfg(test)]
@@ -268,7 +271,7 @@ fn mesh_columns_with_neighbors(
     covered_bounds: Option<[i32; 4]>,
     neighbors: &[Column],
     material: impl FnMut(&Span, Direction) -> Material,
-) -> SectionMesh {
+) -> crate::mesher::SectionMesh {
     assert!(neighbors.is_empty() || neighbors.len() == 4 * CELLS);
     let stride = key.size() / CELLS as i32;
     let edges = std::array::from_fn(|side| {
@@ -284,7 +287,7 @@ fn mesh_columns_with_neighbors(
             })
             .collect()
     });
-    mesh_columns_with_edges(key, columns, covered, covered_bounds, &edges, &[], material)
+    mesh_columns_with_edges(key, columns, covered, covered_bounds, &edges, &[], material).section()
 }
 fn mesh_columns_with_edges(
     key: TileKey,
@@ -294,7 +297,7 @@ fn mesh_columns_with_edges(
     neighbors: &[Vec<EdgeColumn>; 4],
     finer: &[TileKey],
     mut material: impl FnMut(&Span, Direction) -> Material,
-) -> SectionMesh {
+) -> FarMesh {
     assert_eq!(columns.len(), CELLS * CELLS);
     let mut count = CELLS * CELLS;
     let edge_offsets = std::array::from_fn::<_, 4, _>(|side| {
@@ -551,14 +554,14 @@ fn mesh_columns_with_edges(
             }
         }
     }
-    let mut mesh = SectionMesh::default();
+    let mut mesh = FarMesh::default();
     for (key, mut rects) in faces {
         merge(&mut rects);
         for rect in rects {
             emit(&mut mesh, key, rect)
         }
     }
-    mesh.faces = FaceGroups::group(&mut mesh.solid);
+    mesh.finish();
     mesh
 }
 
@@ -611,7 +614,8 @@ mod refinement_tests {
                 fluid: 0,
                 opaque: true,
             },
-        );
+        )
+        .section();
         let [ox, _, oz] = parent.origin();
         let [fx, _, fz] = fine.origin();
         let mut area = 0.0;
@@ -839,70 +843,36 @@ fn merge(rects: &mut Vec<Rect>) {
     }
     rects.truncate(end);
 }
-/// The widest face `emit` writes, in blocks: its UVs, counted from the face's
-/// corner, must stay within `TerrainVertex::tiled`'s range.
-const MAX_FACE: f32 = 1024.0;
-fn emit(mesh: &mut SectionMesh, key: FaceKey, rect: Rect) {
+fn emit(mesh: &mut FarMesh, key: FaceKey, rect: Rect) {
     let mut u0 = rect.u0;
     while u0 < rect.u1 {
         let u1 = rect.u1.min(u0 + MAX_FACE);
         let mut v0 = rect.v0;
         while v0 < rect.v1 {
             let v1 = rect.v1.min(v0 + MAX_FACE);
-            emit_quad(mesh, key, Rect { u0, v0, u1, v1 });
+            let quad = FarQuad::new(
+                key.direction,
+                f32::from_bits(key.plane),
+                [u0, v0, u1, v1],
+                key.layer,
+                key.light,
+                key.color,
+            );
+            if key.translucent {
+                mesh.translucent.push(quad);
+            } else {
+                mesh.solid.push(quad);
+            }
             v0 = v1;
         }
         u0 = u1;
     }
 }
-fn emit_quad(mesh: &mut SectionMesh, key: FaceKey, rect: Rect) {
-    let Rect { u0, v0, u1, v1 } = rect;
-    let p = f32::from_bits(key.plane);
-    let mut points = match key.direction {
-        Direction::Up | Direction::Down => [[u0, p, v1], [u1, p, v1], [u1, p, v0], [u0, p, v0]],
-        Direction::North | Direction::South => [[u0, v1, p], [u1, v1, p], [u1, v0, p], [u0, v0, p]],
-        Direction::West | Direction::East => [[p, v1, u1], [p, v1, u0], [p, v0, u0], [p, v0, u1]],
-    };
-    if matches!(
-        key.direction,
-        Direction::Down | Direction::South | Direction::East
-    ) {
-        points.reverse()
-    }
-    let out = if key.translucent {
-        &mut mesh.translucent
-    } else {
-        &mut mesh.solid
-    };
-    // Tile origins are integer multiples of a block, so local coordinates
-    // retain the world texture phase without distant-coordinate precision loss;
-    // a whole number of blocks off each UV keeps it (the sampler repeats) and
-    // counts it from the face's corner.
-    let uvs = points.map(|pos| match key.direction {
-        Direction::Up | Direction::Down => [pos[0], -pos[2]],
-        Direction::North | Direction::South => [pos[0], -pos[1]],
-        Direction::West | Direction::East => [pos[2], -pos[1]],
-    });
-    let corner = [0, 1].map(|i| {
-        uvs.iter()
-            .map(|uv| uv[i])
-            .fold(f32::INFINITY, f32::min)
-            .floor()
-    });
-    out.extend(points.into_iter().zip(uvs).map(|(pos, uv)| {
-        TerrainVertex::tiled(
-            pos,
-            [uv[0] - corner[0], uv[1] - corner[1]],
-            key.layer,
-            key.color,
-            key.light,
-        )
-    }));
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesher::{SectionMesh, TerrainVertex};
     fn span(min: i16, max: i16, state: u32) -> Span {
         Span {
             min,
@@ -937,6 +907,7 @@ mod tests {
         }
     }
     fn mesh(columns: &[Column]) -> SectionMesh {
+        // `mesh_columns` returns the faces as section vertices.
         mesh_columns(
             TileKey {
                 x: 0,
@@ -954,7 +925,7 @@ mod tests {
     }
     #[test]
     fn wide_faces_split_and_keep_their_texture_phase() {
-        let mut mesh = SectionMesh::default();
+        let mut far = FarMesh::default();
         let key = FaceKey {
             direction: Direction::Up,
             plane: 64.0f32.to_bits(),
@@ -965,15 +936,16 @@ mod tests {
             translucent: false,
         };
         emit(
-            &mut mesh,
+            &mut far,
             key,
             Rect {
                 u0: 0.0,
-                v0: 0.5,
+                v0: 1.0,
                 u1: 2500.0,
                 v1: 16.0,
             },
         );
+        let mesh = far.section();
         // 2500 blocks: 1024 + 1024 + 452.
         assert_eq!(mesh.solid.len(), 3 * 4);
         let mut area = 0.0;
@@ -989,7 +961,7 @@ mod tests {
                 assert!(uv[0] <= MAX_FACE + 1.0 && uv[1] <= MAX_FACE + 1.0);
             }
         }
-        assert_eq!(area, 2500.0 * 15.5);
+        assert_eq!(area, 2500.0 * 15.0);
     }
     fn normal(q: &[TerrainVertex; 4]) -> glam::Vec3 {
         let p = |i: usize| glam::Vec3::from(q[i].pos);
@@ -1260,7 +1232,8 @@ mod tests {
             &neighbors,
             &[],
             material,
-        );
+        )
+        .section();
         let walls: Vec<_> = mesh
             .solid
             .as_chunks::<4>()

@@ -98,6 +98,56 @@ fn terrain_uv(packed: vec2<u32>, step: f32) -> vec2<f32> {
     let origin = slot_origins[block_slots[vertex >> 8u]];
     return terrain_vertex(position, terrain_uv(uv, origin.w), layer, color, light, origin.xyz);
 }
+// Far terrain faces (gfx/lod.rs; the layout is lod/quads.rs's): one 16-byte
+// record per axis-aligned quad, six vertices each in quad_indices' corner
+// order. Coordinates are tile-local blocks; heights are stored from y = -64,
+// and a flag per edge lowers it by 1/9 (a fluid's surface).
+@group(1) @binding(2) var<storage, read> far_quads: array<vec4<u32>>;
+@vertex fn vs_far(@builtin(vertex_index) vertex: u32, @location(5) origin: vec4<f32>)
+    -> TerrainOut {
+    let q = far_quads[vertex / 6u];
+    let order = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+    var corner = order[vertex % 6u];
+    // Down, Up, North, South, West, East.
+    let direction = (q.x >> 30u) | (((q.y >> 26u) & 1u) << 2u);
+    let low_a = f32((q.y >> 27u) & 1u) / 9.0;
+    let low_b = f32((q.y >> 28u) & 1u) / 9.0;
+    let u0 = f32(q.x & 0x7fffu);
+    let u1 = u0 + f32((q.y >> 15u) & 0x7ffu);
+    let stored_v0 = (q.x >> 15u) & 0x7fffu;
+    var v0 = f32(stored_v0);
+    var v1 = f32(stored_v0 + (q.z & 0x7ffu));
+    var p = f32(q.y & 0x7fffu);
+    if direction < 2u {
+        p = p - 64.0 - low_a;
+    } else {
+        v0 = v0 - 64.0 - low_a;
+        v1 = v1 - 64.0 - low_b;
+    }
+    if direction == 0u || direction == 3u || direction == 5u {
+        corner = 3u - corner;
+    }
+    // Corners 0..3: (u0, v1), (u1, v1), (u1, v0), (u0, v0); West and East
+    // faces run their u the other way.
+    var high_u = corner == 1u || corner == 2u;
+    if direction >= 4u {
+        high_u = !high_u;
+    }
+    let u = select(u0, u1, high_u);
+    let v = select(v1, v0, corner >= 2u);
+    var pos = vec3(u, p, v);
+    if direction == 2u || direction == 3u {
+        pos = vec3(u, v, p);
+    } else if direction >= 4u {
+        pos = vec3(p, v, u);
+    }
+    // Merged faces repeat their sprite once per block from the face's corner.
+    let uv = vec2(u - u0, ceil(v1) - v);
+    let b = q.w >> 24u;
+    let color = unpack4x8unorm((q.w & 0xffffffu) | 0xff000000u);
+    return terrain_vertex(pos, uv, q.z >> 11u, color,
+        vec2((b & 15u) * 16u, (b >> 4u) * 16u), origin.xyz);
+}
 fn terrain_vertex(position: vec3<f32>, uv: vec2<f32>, layer: u32, color: vec4<f32>,
     light: vec2<u32>, origin: vec3<f32>) -> TerrainOut {
     let pos = position + origin;
