@@ -3296,8 +3296,9 @@ impl Renderer {
                 bytemuck::cast_slice(&frame.celestial[..celestial_vertices]),
             );
         }
-        let max_quads =
-            (world_quads + additive_quads + hand_quads + see_through_quads).max(cloud_quads);
+        let max_quads = (world_quads + additive_quads + hand_quads + see_through_quads)
+            .max(cloud_quads)
+            .max(self.far.largest_draw());
         if max_quads > self.index_quads {
             self.index_quads = max_quads.next_power_of_two();
             self.indices = Self::quad_indices(&self.device, self.index_quads);
@@ -3567,8 +3568,13 @@ impl Renderer {
                 }
             }
             // Far terrain behind the near terrain, which hides much of it.
-            self.far
-                .draw(&mut pass, &self.instances, false, self.multi_draw);
+            self.far.draw(
+                &mut pass,
+                &self.instances,
+                &self.indices,
+                false,
+                self.multi_draw,
+            );
             if entity_quads > 0 {
                 pass.set_pipeline(&self.entity_pipeline);
                 pass.set_bind_group(0, &self.entity_group, &[]);
@@ -3619,8 +3625,13 @@ impl Renderer {
                 pass.draw(0..4, debug_depth..debug_depth + debug_top);
             }
             // Far water before the near water in front of it.
-            self.far
-                .draw(&mut pass, &self.instances, true, self.multi_draw);
+            self.far.draw(
+                &mut pass,
+                &self.instances,
+                &self.indices,
+                true,
+                self.multi_draw,
+            );
             match self.flat.as_ref().filter(|_| flat_frame) {
                 Some(flat) => {
                     pass.set_pipeline(&flat.translucent);

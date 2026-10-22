@@ -17,8 +17,9 @@ use std::time::{Duration, Instant};
 
 /// Bytes of one face record.
 const QUAD: u64 = std::mem::size_of::<FarQuad>() as u64;
-/// An indirect draw: vertex count, instance count, first vertex, first instance.
-type Draw = [u32; 4];
+/// An indexed indirect draw over `quad_indices`: index count, instance
+/// count, first index (0), base vertex (four per quad), first instance.
+type Draw = [u32; 5];
 
 /// Finished tile meshes not uploaded yet, the tiles they replace (removed
 /// once every mesh is in) and the columns they leave out.
@@ -208,7 +209,7 @@ impl Far {
             solid_draws: 0,
             indirect: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Far terrain draws"),
-                size: 1024 * 16,
+                size: 1024 * 20,
                 usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
@@ -246,7 +247,7 @@ impl Far {
                 .ranges(eye - Vec3::from(v.origin), |first, quads| {
                     let first = tile.start + u64::from(first);
                     self.draws
-                        .push([quads * 6, 1, (first * 6) as u32, instance]);
+                        .push([quads * 6, 1, 0, (first * 4) as u32, instance]);
                     self.pages.push(tile.page);
                 });
         }
@@ -258,7 +259,8 @@ impl Far {
                 self.draws.push([
                     tile.translucent * 6,
                     1,
-                    (first * 6) as u32,
+                    0,
+                    (first * 4) as u32,
                     (first_instance + i) as u32,
                 ]);
                 self.pages.push(tile.page);
@@ -286,7 +288,7 @@ impl Far {
                 self.indirect_capacity = (self.draws.len() as u64).next_power_of_two();
                 self.indirect = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Far terrain draws"),
-                    size: self.indirect_capacity * 16,
+                    size: self.indirect_capacity * 20,
                     usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
@@ -304,12 +306,24 @@ impl Far {
         self.draws.len()
     }
 
+    /// Quads this frame's draws cover.
+    pub fn drawn_quads(&self) -> u64 {
+        self.draws.iter().map(|d| u64::from(d[0] / 6)).sum()
+    }
+
+    /// The most quads one draw covers: `quad_indices` must hold as many.
+    pub fn largest_draw(&self) -> u32 {
+        self.draws.iter().map(|d| d[0] / 6).max().unwrap_or(0)
+    }
+
     /// Draws the solid or translucent draws `prepare` made, with the terrain
-    /// bindings in group 0 and `instances` (the frame's origins) bound here.
+    /// bindings in group 0, `instances` (the frame's origins) and `indices`
+    /// (`quad_indices`) bound here.
     pub fn draw(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         instances: &wgpu::Buffer,
+        indices: &wgpu::Buffer,
         translucent: bool,
         multi_draw: bool,
     ) {
@@ -327,6 +341,7 @@ impl Far {
             &self.solid
         });
         pass.set_vertex_buffer(0, instances.slice(..));
+        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
         while i < end {
             let page = self.pages[i];
             let run = self.pages[i..end]
@@ -339,10 +354,10 @@ impl Far {
                 &[],
             );
             if multi_draw {
-                pass.multi_draw_indirect(&self.indirect, i as u64 * 16, run as u32);
+                pass.multi_draw_indexed_indirect(&self.indirect, i as u64 * 20, run as u32);
             } else {
                 for d in &self.draws[i..i + run] {
-                    pass.draw(d[2]..d[2] + d[0], d[3]..d[3] + 1);
+                    pass.draw_indexed(0..d[0], d[3] as i32, d[4]..d[4] + 1);
                 }
             }
             i += run;
@@ -353,6 +368,11 @@ impl Far {
 impl Renderer {
     pub fn resident_lods(&self) -> usize {
         self.lods.len()
+    }
+
+    /// Far tiles and their quads drawn in the last frame.
+    pub fn drawn_far(&self) -> (usize, u64) {
+        (self.visible_lods.len(), self.far.drawn_quads())
     }
 
     /// Resident tiles per level: (level, tiles, solid quads, translucent quads).

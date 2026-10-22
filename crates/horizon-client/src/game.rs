@@ -1103,6 +1103,9 @@ struct Game<'a> {
     lod_observe: horizon_client::fast_hash::FxHashSet<(i32, i32)>,
     /// The detail revision, centre and radius `Lod::update` last had covered for.
     lod_covered_at: Option<(u64, (i32, i32), i32)>,
+    /// The last frame's vertical field of view, in degrees: a magnified
+    /// view (a spyglass, zoom) refines the far terrain it sees.
+    frame_fov: f32,
     options: Options,
     player: Option<PlayerMotion>,
     spawn: Option<Vec3>,
@@ -9542,6 +9545,7 @@ impl Game<'_> {
         } else {
             self.bob_matrix(camera_alpha as f32)
         };
+        self.frame_fov = fov_degrees;
         let terrain_distance = self.terrain_distance();
         let distance = (terrain_distance * 16) as f32;
         let depth_far =
@@ -10220,6 +10224,13 @@ impl Game<'_> {
                             })
                             .collect()
                     })
+                });
+                lod.set_view(horizon_client::lod::View {
+                    y: player.position.y + f64::from(player.dimensions.eye_height),
+                    yaw: self.yaw,
+                    pitch: self.pitch,
+                    fov: self.frame_fov,
+                    aspect: renderer.config.width as f32 / renderer.config.height.max(1) as f32,
                 });
                 let meshes = horizon_client::spans::time("lod_update", || {
                     lod.update(
@@ -11209,6 +11220,7 @@ impl<'a> Game<'a> {
             lod_source_attempted: false,
             lod_observe: Default::default(),
             lod_covered_at: None,
+            frame_fov: 70.0,
             options,
             player: None,
             spawn: None,

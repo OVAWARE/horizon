@@ -99,15 +99,15 @@ fn terrain_uv(packed: vec2<u32>, step: f32) -> vec2<f32> {
     return terrain_vertex(position, terrain_uv(uv, origin.w), layer, color, light, origin.xyz);
 }
 // Far terrain faces (gfx/lod.rs; the layout is lod/quads.rs's): one 16-byte
-// record per axis-aligned quad, six vertices each in quad_indices' corner
+// record per axis-aligned quad, four vertices each in quad_indices' corner
 // order. Coordinates are tile-local blocks; heights are stored from y = -64,
 // and a flag per edge lowers it by 1/9 (a fluid's surface).
 @group(1) @binding(2) var<storage, read> far_quads: array<vec4<u32>>;
 @vertex fn vs_far(@builtin(vertex_index) vertex: u32, @location(5) origin: vec4<f32>)
     -> TerrainOut {
-    let q = far_quads[vertex / 6u];
-    let order = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
-    var corner = order[vertex % 6u];
+    // Drawn indexed with quad_indices: four vertices a quad, shaded once each.
+    let q = far_quads[vertex / 4u];
+    var corner = vertex % 4u;
     // Down, Up, North, South, West, East.
     let direction = (q.x >> 30u) | (((q.y >> 26u) & 1u) << 2u);
     let low_a = f32((q.y >> 27u) & 1u) / 9.0;

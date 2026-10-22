@@ -764,6 +764,8 @@ impl Game<'_> {
                 "culled_sections": r.culled_sections(),
                 "uploaded_bytes": r.uploaded_bytes,
                 "resident_sections": r.resident_sections(),
+                "drawn_far_tiles": r.drawn_far().0,
+                "drawn_far_quads": r.drawn_far().1,
                 "lod_levels": r.lod_levels().into_iter().map(|(level, tiles, solid, translucent)| json!({
                     "level": level, "tiles": tiles, "solid_quads": solid, "translucent_quads": translucent,
                 })).collect::<Vec<_>>(),

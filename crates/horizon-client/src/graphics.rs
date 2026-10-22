@@ -159,7 +159,7 @@ pub enum Overlay {
 /// The farthest LOD Distance, in chunks, on integrated GPUs other than
 /// Apple's: they share the CPU's memory bandwidth, and past it far terrain
 /// costs them more frame time than it is worth.
-pub const INTEGRATED_LOD_DISTANCE: u32 = 128;
+pub const INTEGRATED_LOD_DISTANCE: u32 = 1024;
 /// Whether `INTEGRATED_LOD_DISTANCE` applies to this adapter. Apple's GPUs
 /// are integrated too, with memory and bandwidth enough for every distance.
 pub fn lod_capped(info: &wgpu::AdapterInfo) -> bool {

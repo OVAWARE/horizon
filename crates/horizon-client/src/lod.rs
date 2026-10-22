@@ -25,7 +25,16 @@ const MAX_SAVED: usize = 1024;
 /// How many resident chunks may wait for the worker's summary at once
 /// (`Lod::observing`).
 pub const OBSERVE_AHEAD: usize = 8;
-const SAMPLE_JOBS: usize = 4;
+/// Sample jobs in flight while the near terrain loads: its chunks get the
+/// cores first.
+const NEAR_LOADING_SAMPLE_JOBS: usize = 2;
+/// The far sampling pool: half the machine's threads, as the near terrain's
+/// workers sit idle once it has loaded.
+fn sampling_threads() -> usize {
+    thread::available_parallelism()
+        .map_or(1, |n| n.get() / 2)
+        .clamp(1, 16)
+}
 /// While the near terrain loads on a machine with four threads or fewer, far
 /// terrain starts one sample job at most this often and no detail: it would
 /// otherwise take the cores the near chunks and the frame need.
@@ -232,6 +241,33 @@ impl Column {
         column
     }
 }
+/// The heights `key`'s terrain spans, from its own or its nearest sampled
+/// ancestor's samples (`sampled_heights`), else the world's.
+fn height_range(key: TileKey, heights: impl Fn(TileKey) -> Option<(i32, i32)>) -> (i32, i32) {
+    let mut ancestor = key;
+    loop {
+        if let Some((low, high)) = heights(ancestor) {
+            // Samples miss peaks between them: allow a cell's height.
+            let margin = 16 + key.size() / 16;
+            return (low - margin, high + margin);
+        }
+        if ancestor.level >= MAX_LEVEL {
+            return (MIN_Y, MIN_Y + crate::chunk::HEIGHT);
+        }
+        ancestor = ancestor.parent();
+    }
+}
+/// The lowest and highest surface among a tile's samples.
+fn sampled_heights(samples: &[Column]) -> Option<(i32, i32)> {
+    samples
+        .iter()
+        .filter_map(|column| column.spans.iter().rev().find(|span| span.min < span.max))
+        .map(|span| i32::from(span.max))
+        .fold(None, |range, top| match range {
+            None => Some((top, top)),
+            Some((low, high)) => Some((low.min(top), high.max(top))),
+        })
+}
 /// A chunk's 256 columns (`Column::from_chunk`), on the far-terrain worker.
 fn summarize(chunk: &Chunk, kinds: &[u8]) -> Arc<[Column; 256]> {
     Arc::new(std::array::from_fn(|i| {
@@ -317,18 +353,147 @@ impl TileKey {
         forward > 0. && left > 0. && right > 0.
     }
 }
+/// What the camera sees, so that a magnified view (a spyglass, zoom) gets
+/// the detail its narrower field of view shows: projected error scales with
+/// `1 / tan(fov / 2)`. Only tiles inside the view are refined further, so
+/// what lies outside it keeps its ordinary detail for when the view widens.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct View {
+    /// Eye height.
+    pub y: f64,
+    /// Minecraft's yaw (0 faces +Z, 90 faces -X) and pitch (positive looks
+    /// down), in degrees.
+    pub yaw: f32,
+    pub pitch: f32,
+    /// The vertical field of view, in degrees, and width over height.
+    pub fov: f32,
+    pub aspect: f32,
+}
+/// Fields of view at most this many times narrower than 70° refine further.
+const MAX_ZOOM: f32 = 16.0;
+/// Narrower than 70° by less than this, nothing is refined for the view:
+/// sprinting and speed effects change the FOV slightly all the time.
+const ZOOMED: f32 = 1.25;
+/// The most tiles a magnified view's plan holds.
+const ZOOMED_NODES: usize = 20_000;
+impl View {
+    /// How many times smaller than at 70° a block appears on screen.
+    fn zoom(&self) -> f32 {
+        (35f32.to_radians().tan() / (self.fov.to_radians() * 0.5).tan()).clamp(0.0, MAX_ZOOM)
+    }
+    fn zoomed(&self) -> Option<Zoom> {
+        let zoom = self.zoom();
+        (zoom >= ZOOMED).then(|| {
+            let half_v = (self.fov.to_radians() * 0.5).min(1.5);
+            let half_h = (half_v.tan() * self.aspect.max(0.1)).atan();
+            // A margin keeps a slow pan inside the refined area until the
+            // plan follows it (`Zoom::key`).
+            Zoom {
+                zoom,
+                eye: self.y,
+                yaw: self.yaw.to_radians(),
+                elevation: -self.pitch.to_radians(),
+                half_h: (half_h * 1.2 + 0.01).min(std::f32::consts::FRAC_PI_2),
+                half_v: half_v * 1.2 + 0.01,
+            }
+        })
+    }
+}
+/// A magnified view, in radians.
+#[derive(Clone, Copy, Debug)]
+struct Zoom {
+    zoom: f32,
+    eye: f64,
+    yaw: f32,
+    elevation: f32,
+    half_h: f32,
+    half_v: f32,
+}
+impl Zoom {
+    /// Changes when the plan should follow the view: the zoom in quarter
+    /// octaves, the direction in a quarter of the refined area's width.
+    fn key(&self) -> [i32; 3] {
+        [
+            (self.zoom.log2() * 4.0).round() as i32,
+            (self.yaw / (self.half_h / 4.0)).round() as i32,
+            (self.elevation / (self.half_v / 4.0)).round() as i32,
+        ]
+    }
+    /// Whether any of `key`'s area, between heights `heights`, is in view.
+    fn sees(&self, key: TileKey, camera: [i32; 2], (low, high): (i32, i32)) -> bool {
+        let [x0, _, z0] = key.origin();
+        let (x1, z1) = (x0 + key.size(), z0 + key.size());
+        let (cx, cz) = (camera[0] as f32, camera[1] as f32);
+        let (x0, z0, x1, z1) = (x0 as f32, z0 as f32, x1 as f32, z1 as f32);
+        let near_x = (x0 - cx).max(cx - x1).max(0.0);
+        let near_z = (z0 - cz).max(cz - z1).max(0.0);
+        let nearest = near_x.hypot(near_z);
+        let farthest = (x0 - cx)
+            .abs()
+            .max((x1 - cx).abs())
+            .hypot((z0 - cz).abs().max((z1 - cz).abs()));
+        // Above and below: the angles of the box's top and bottom.
+        let eye = self.eye as f32;
+        let (high, low) = (high as f32, low as f32);
+        let top = (high - eye).atan2(if high > eye { nearest } else { farthest });
+        let bottom = (low - eye).atan2(if low < eye { nearest } else { farthest });
+        if top < self.elevation - self.half_v || bottom > self.elevation + self.half_v {
+            return false;
+        }
+        if nearest == 0.0 {
+            return true;
+        }
+        // Sideways: a corner inside the wedge, or an edge of it crossing the box.
+        let (sin, cos) = self.yaw.sin_cos();
+        let (fx, fz) = (-sin, cos);
+        let inside = |x: f32, z: f32| {
+            let (dx, dz) = (x - cx, z - cz);
+            let f = dx * fx + dz * fz;
+            let side = dx * fz - dz * fx;
+            f > 0.0 && side.atan2(f).abs() <= self.half_h
+        };
+        if [(x0, z0), (x1, z0), (x0, z1), (x1, z1)]
+            .into_iter()
+            .any(|(x, z)| inside(x, z))
+        {
+            return true;
+        }
+        [-self.half_h, self.half_h].into_iter().any(|turn| {
+            let (s, c) = turn.sin_cos();
+            // The forward direction turned by `turn`.
+            let (dx, dz) = (fx * c - fz * s, fz * c + fx * s);
+            let slab = |origin: f32, d: f32, lo: f32, hi: f32| {
+                if d.abs() < 1e-9 {
+                    if (lo..=hi).contains(&origin) {
+                        (f32::NEG_INFINITY, f32::INFINITY)
+                    } else {
+                        (f32::INFINITY, f32::NEG_INFINITY)
+                    }
+                } else {
+                    let (a, b) = ((lo - origin) / d, (hi - origin) / d);
+                    (a.min(b), a.max(b))
+                }
+            };
+            let (ax, bx) = slab(cx, dx, x0, x1);
+            let (az, bz) = slab(cz, dz, z0, z1);
+            let enter = ax.max(az);
+            let exit = bx.min(bz);
+            enter <= exit && exit >= 0.0
+        })
+    }
+}
 #[derive(Default)]
 struct Plan {
     roots: Vec<TileKey>,
     nodes: FxHashSet<TileKey>,
     split: FxHashSet<TileKey>,
-    elevation: i32,
 }
 impl Plan {
     #[cfg(test)]
     fn new(camera: [i32; 2], detail: i32, distance: u32) -> Self {
         Self::with_previous(camera, detail, distance, &Self::default(), 0)
     }
+    #[cfg(test)]
     fn with_previous(
         camera: [i32; 2],
         detail: i32,
@@ -336,41 +501,90 @@ impl Plan {
         previous: &Self,
         elevation: i32,
     ) -> Self {
+        Self::with_view(camera, detail, distance, previous, elevation, None, |_| {
+            None
+        })
+    }
+    /// The tiles to draw: each splits while its cells would look too large
+    /// on screen, largest first; `zoom` magnifies what it sees, within
+    /// `ZOOMED_NODES`. `heights` gives a tile's sampled terrain heights.
+    fn with_view(
+        camera: [i32; 2],
+        detail: i32,
+        distance: u32,
+        previous: &Self,
+        elevation: i32,
+        zoom: Option<Zoom>,
+        heights: impl Fn(TileKey) -> Option<(i32, i32)>,
+    ) -> Self {
         let range = distance.min(1024) as i32 * 16;
         let mut level = 0;
         while (16 << level) < range {
             level += 1;
         }
         let size = 16 << level;
-        let mut result = Self {
-            elevation,
-            ..Self::default()
+        let mut result = Self::default();
+        // How far past splitting each tile is, for a 70° view and for this
+        // one: over 1, it splits. Keep
+        // distant cells small on screen (a cell is a 16th of its tile, under
+        // about 6 pixels of a 1080-line screen at 70°); finest tiles retain
+        // individual blocks.
+        let need_of = |key: TileKey| -> (f32, f32) {
+            if key.level == 0 {
+                return (0.0, 0.0);
+            }
+            let distance = key.distance(camera);
+            if distance < detail * 16 + 16 {
+                return (f32::INFINITY, f32::INFINITY);
+            }
+            let factor = if previous.split.contains(&key) { 10 } else { 8 };
+            let threshold = (key.size() * factor) as f32;
+            let mut magnified = threshold;
+            if let Some(zoom) = zoom {
+                if zoom.sees(key, camera, height_range(key, &heights)) {
+                    magnified *= zoom.zoom;
+                }
+            }
+            let distance = distance.max(elevation).max(1) as f32;
+            (threshold / distance, magnified / distance)
         };
+        // What a 70° view needs comes first and is never cut by the budget.
+        let entry = |key: TileKey| {
+            let (base, magnified) = need_of(key);
+            (base > 1.0, magnified.to_bits(), key)
+        };
+        let mut queue = std::collections::BinaryHeap::new();
         for z in (camera[1] - range).div_euclid(size)..=(camera[1] + range).div_euclid(size) {
             for x in (camera[0] - range).div_euclid(size)..=(camera[0] + range).div_euclid(size) {
                 let key = TileKey { x, z, level };
                 result.roots.push(key);
-                result.visit(key, camera, detail, range, previous);
+                if key.distance(camera) <= range {
+                    result.nodes.insert(key);
+                    queue.push(entry(key));
+                }
+            }
+        }
+        let budget = if zoom.is_some() {
+            ZOOMED_NODES
+        } else {
+            usize::MAX
+        };
+        while let Some((needed, need, key)) = queue.pop() {
+            if f32::from_bits(need) <= 1.0 {
+                break;
+            }
+            if !needed && result.nodes.len() + 4 > budget {
+                continue;
+            }
+            result.split.insert(key);
+            for child in key.children() {
+                if child.distance(camera) <= range {
+                    result.nodes.insert(child);
+                    queue.push(entry(child));
+                }
             }
         }
         result
-    }
-    fn visit(&mut self, key: TileKey, camera: [i32; 2], detail: i32, range: i32, previous: &Self) {
-        if key.distance(camera) > range {
-            return;
-        }
-        self.nodes.insert(key);
-        // Keep distant cells small on screen; finest tiles retain individual blocks.
-        let threshold = key.size() * if previous.split.contains(&key) { 10 } else { 8 };
-        if key.level > 0
-            && (key.distance(camera) < detail * 16 + 16
-                || key.distance(camera).max(self.elevation) < threshold)
-        {
-            self.split.insert(key);
-            for child in key.children() {
-                self.visit(child, camera, detail, range, previous);
-            }
-        }
     }
     fn select(
         &self,
@@ -518,7 +732,13 @@ pub struct Lod {
     /// The plan or the covered columns changed: covered leaves need stand-ins.
     replanned: bool,
     invalidated: FxHashSet<(i32, i32)>,
-    area: Option<([i32; 2], i32, u32, i32)>,
+    area: Option<([i32; 2], i32, u32, i32, Option<[i32; 3]>)>,
+    /// The camera's view (`set_view`); `None` plans for a 70° view.
+    view: Option<View>,
+    /// Each ready tile's lowest and highest sampled surface.
+    heights: FxHashMap<TileKey, (i32, i32)>,
+    /// The magnified view the plan follows, if any.
+    zoom: Option<Zoom>,
     plan: Plan,
     pending: FxHashSet<TileKey>,
     sample_nearby: bool,
@@ -531,6 +751,9 @@ pub struct Lod {
     near_loading: bool,
     /// When `request_samples` last started a job while held.
     held_sample_at: std::time::Instant,
+    /// Sample jobs in flight at most: two per sampling thread, so none idles
+    /// while its next tile is chosen.
+    sample_jobs: usize,
     /// Each tile's samples, shared with mesh jobs in flight.
     ready: FxHashMap<TileKey, Arc<Vec<Column>>>,
     active: FxHashSet<TileKey>,
@@ -561,9 +784,7 @@ impl Lod {
             .name("Far terrain".into())
             .spawn(move || {
                 let mut sampler = source.sampler();
-                let count = thread::available_parallelism()
-                    .map_or(1, |n| n.get() / 4)
-                    .clamp(1, 3);
+                let count = sampling_threads();
                 let mut sampling = Vec::new();
                 for _ in 0..count {
                     let Some(mut sample) = sampler.fork() else {
@@ -715,6 +936,9 @@ impl Lod {
             replanned: true,
             invalidated: FxHashSet::default(),
             area: None,
+            view: None,
+            heights: FxHashMap::default(),
+            zoom: None,
             plan: Plan::default(),
             pending: FxHashSet::default(),
             sample_nearby: true,
@@ -724,6 +948,7 @@ impl Lod {
             small: thread::available_parallelism().map_or(1, |n| n.get()) <= 4,
             near_loading: false,
             held_sample_at: std::time::Instant::now(),
+            sample_jobs: 2 * sampling_threads(),
             ready: FxHashMap::default(),
             active: FxHashSet::default(),
             dirty: FxHashSet::default(),
@@ -734,6 +959,15 @@ impl Lod {
             saved: FxHashMap::default(),
             reduced: FxHashMap::default(),
             saved_order: VecDeque::new(),
+        }
+    }
+    /// The camera's field of view and direction for the next `update`: a
+    /// magnified view refines what it sees.
+    pub fn set_view(&mut self, view: View) {
+        // HORIZON_FAR_ZOOM=0 plans every view as a 70° one (A/B checks).
+        static ZOOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ZOOM.get_or_init(|| std::env::var("HORIZON_FAR_ZOOM").as_deref() != Ok("0")) {
+            self.view = Some(view);
         }
     }
     pub fn stats(&self) -> (usize, usize) {
@@ -908,6 +1142,9 @@ impl Lod {
                     }
                 }
             }
+            if let Some(heights) = sampled_heights(&samples) {
+                self.heights.insert(key, heights);
+            }
             self.ready.insert(key, Arc::new(samples));
             self.reselect = true;
         }
@@ -1016,18 +1253,32 @@ impl Lod {
             camera[0] - (yaw.sin() * ahead) as i32,
             camera[1] + (yaw.cos() * ahead) as i32,
         ];
-        // Replan at chunk boundaries, not on every camera movement.
+        let zoom = self.view.and_then(|view| view.zoomed());
+        self.zoom = zoom;
+        // Replan at chunk boundaries, not on every camera movement, and as a
+        // magnified view turns.
         let area = (
             [camera[0].div_euclid(16), camera[1].div_euclid(16)],
             detail,
             distance,
             elevation,
+            zoom.map(|zoom| zoom.key()),
         );
         if self.area != Some(area) {
             crate::spans::time("lod_plan", || {
                 self.area = Some(area);
-                self.plan = Plan::with_previous(camera, detail, distance, &self.plan, elevation);
+                let heights = &self.heights;
+                self.plan = Plan::with_view(
+                    camera,
+                    detail,
+                    distance,
+                    &self.plan,
+                    elevation,
+                    zoom,
+                    |key| heights.get(&key).copied(),
+                );
                 self.ready.retain(|key, _| self.plan.nodes.contains(key));
+                self.heights.retain(|key, _| self.plan.nodes.contains(key));
                 self.detail_masks
                     .retain(|key, _| self.plan.nodes.contains(key));
                 self.replanned = true;
@@ -1185,8 +1436,12 @@ impl Lod {
             usize::from(
                 self.pending.is_empty() && self.held_sample_at.elapsed() >= HELD_SAMPLE_STEP,
             )
+        } else if self.near_loading {
+            NEAR_LOADING_SAMPLE_JOBS
+                .min(self.sample_jobs)
+                .saturating_sub(self.pending.len())
         } else {
-            SAMPLE_JOBS.saturating_sub(self.pending.len())
+            self.sample_jobs.saturating_sub(self.pending.len())
         };
         if free == 0 {
             return;
@@ -1202,13 +1457,24 @@ impl Lod {
                 wanted.push((0, 0, root));
             }
         }
+        // What a magnified view sees comes first, the largest on screen
+        // first, so all of it sharpens together.
+        let heights = |key: TileKey| self.heights.get(&key).copied();
+        let magnified = |key: TileKey| {
+            self.zoom
+                .filter(|zoom| zoom.sees(key, camera, height_range(key, heights)))
+                .map(|_| -(i64::from(key.size()) << 20) / i64::from(key.distance(camera).max(1)))
+        };
         for &key in &self.plan.nodes {
             if !self.plan.split.contains(&key) && !self.ready.contains_key(&key) {
-                wanted.push((
-                    if key.in_view(camera, yaw) { 1 } else { 3 },
-                    i64::from(key.distance(focus)) * 4 + i64::from(key.distance(camera)),
-                    key,
-                ));
+                wanted.push(match magnified(key) {
+                    Some(priority) => (0, priority, key),
+                    None => (
+                        if key.in_view(camera, yaw) { 1 } else { 3 },
+                        i64::from(key.distance(focus)) * 4 + i64::from(key.distance(camera)),
+                        key,
+                    ),
+                });
             }
         }
         let mut fallback = Vec::new();
@@ -1234,8 +1500,8 @@ impl Lod {
         }
         // Only the first `free` keys not already pending are taken. A key is
         // listed at most twice (as a root and as a node), so the best
-        // `2 * (SAMPLE_JOBS + pending)` entries hold them, in order.
-        let best = 2 * (SAMPLE_JOBS + self.pending.len());
+        // `2 * (sample_jobs + pending)` entries hold them, in order.
+        let best = 2 * (self.sample_jobs + self.pending.len());
         if wanted.len() > best {
             wanted.select_nth_unstable(best);
             wanted.truncate(best);
@@ -1452,6 +1718,90 @@ mod tests {
             .origin(),
             [-32, 0, -64]
         );
+    }
+    fn view(fov: f32, yaw: f32, pitch: f32) -> View {
+        View {
+            y: 100.0,
+            yaw,
+            pitch,
+            fov,
+            aspect: 16.0 / 9.0,
+        }
+    }
+    #[test]
+    fn ordinary_fields_of_view_plan_as_a_70_degree_view() {
+        for fov in [70.0, 90.0, 110.0, 60.0] {
+            let zoom = view(fov, 0.0, 0.0).zoomed();
+            assert!(zoom.is_none(), "{fov}° is not magnified");
+        }
+        let a = Plan::new([5, -7], 12, 1024);
+        let b = Plan::with_view([5, -7], 12, 1024, &Plan::default(), 0, None, |_| {
+            Some((60, 70))
+        });
+        assert_eq!(a.nodes, b.nodes);
+        assert_eq!(a.split, b.split);
+    }
+    #[test]
+    fn a_spyglass_refines_what_it_sees_and_nothing_else() {
+        let camera = [0, 0];
+        let base = Plan::new(camera, 12, 1024);
+        // A spyglass: a tenth of the field of view, facing +Z (yaw 0).
+        let zoom = view(7.0, 0.0, 0.0).zoomed().expect("magnified");
+        let zoomed = Plan::with_view(camera, 12, 1024, &Plan::default(), 0, Some(zoom), |_| {
+            Some((60, 80))
+        });
+        assert!(zoomed.nodes.len() <= ZOOMED_NODES);
+        assert!(base.split.is_subset(&zoomed.split));
+        let leaves = |plan: &Plan, f: &dyn Fn(TileKey) -> bool| {
+            plan.nodes
+                .iter()
+                .filter(|k| !plan.split.contains(k) && f(**k))
+                .count()
+        };
+        // Far ahead: much finer tiles. Behind: exactly what it was.
+        let ahead = |k: TileKey| k.origin()[2] > 4096 && k.origin()[0].abs() < 1024;
+        let behind = |k: TileKey| k.origin()[2] + k.size() < -1024;
+        assert!(leaves(&zoomed, &ahead) > 4 * leaves(&base, &ahead));
+        assert_eq!(leaves(&zoomed, &behind), leaves(&base, &behind));
+        let finest_ahead = |plan: &Plan| {
+            plan.nodes
+                .iter()
+                .filter(|k| {
+                    !plan.split.contains(k) && k.origin()[2] > 8192 && k.origin()[0].abs() < 512
+                })
+                .map(|k| k.level)
+                .min()
+        };
+        assert!(finest_ahead(&zoomed) < finest_ahead(&base));
+    }
+    #[test]
+    fn a_narrow_view_crossing_a_large_tile_sees_it() {
+        let zoom = view(2.0, 0.0, 0.0).zoomed().unwrap();
+        // 16384 wide, straddling the view line ahead: no corner is inside.
+        let tile = TileKey {
+            x: -1,
+            z: 0,
+            level: 10,
+        };
+        let shifted = |x| TileKey { x, z: 1, level: 6 };
+        assert!(zoom.sees(tile, [0, -100], (60, 70)));
+        assert!(zoom.sees(shifted(-1), [0, 0], (60, 70)));
+        assert!(!zoom.sees(shifted(3), [0, 0], (60, 70)), "beside the view");
+        assert!(
+            !zoom.sees(shifted(-1), [0, 4000], (60, 70)),
+            "behind the camera"
+        );
+        // Looking up at the sky with a spyglass: low terrain is out of view.
+        let up = view(7.0, 0.0, -45.0).zoomed().unwrap();
+        assert!(!up.sees(
+            TileKey {
+                x: 0,
+                z: 20,
+                level: 6
+            },
+            [0, 0],
+            (60, 70)
+        ));
     }
     #[test]
     fn aerial_distance_avoids_unseen_full_detail_outside_the_near_area() {
@@ -1807,7 +2157,7 @@ mod tests {
         // Exercise the actual worker/update seam: a parent stays displayed
         // until all four child meshes can replace it in the same update.
         let camera = [-256.0, 100.0, -256.0];
-        lod.area = Some(([-16, -16], 2, 64, 0));
+        lod.area = Some(([-16, -16], 2, 64, 0, None));
         lod.plan.roots = vec![key];
         lod.plan.nodes.insert(key);
         // As a replan does (`update` only selects after a change).
@@ -1893,7 +2243,7 @@ mod tests {
         lod.ready
             .insert(parent, Arc::new(vec![Column::default(); 256]));
         lod.active = [parent].into_iter().collect();
-        lod.pending = (0..SAMPLE_JOBS - 1)
+        lod.pending = (0..lod.sample_jobs - 1)
             .map(|i| TileKey {
                 x: 999 + i as i32,
                 z: 999,
@@ -1951,7 +2301,7 @@ mod tests {
         }
         lod.active = [near, far].into_iter().collect();
         lod.shared.jobs.lock().unwrap().clear();
-        lod.pending = (0..SAMPLE_JOBS - 1)
+        lod.pending = (0..lod.sample_jobs - 1)
             .map(|i| TileKey {
                 x: 999 + i as i32,
                 z: 999,

@@ -39,6 +39,8 @@ WORLD = "FarViewBench"
 # On the mountain of tools/graphics_bench.py, looking west over the land.
 VISTA = (560.0, 262.0, 860.0)
 YAW, PITCH = 90.0, 2.0
+# The spyglass looks past the mountain's shoulder at the coast 6-10 km away.
+SPY_YAW, SPY_PITCH = 130.0, 0.5
 FLIGHT = ((560.0, 262.0, 860.0), (176.0, 262.0, 860.0))
 OPTIONS = """version:4790
 enableVsync:false
@@ -135,11 +137,16 @@ def run_distance(args, ctl, env, cwd, distance, shots):
               flush=True)
         time.sleep(args.settle)
         result["still"] = game.run("bench", args.seconds)
+        r = game.run("status").get("renderer") or {}
+        print(f"  still draws {r.get('drawn_far_tiles')} far tiles, {r.get('drawn_far_quads')} far quads,"
+              f" {r.get('section_draws')} draws", flush=True)
         print(frame_line("still", result["still"]), flush=True)
         game.run("screenshot", shots / f"lod{distance}-view.png")
 
-        game.run("give", "minecraft:spyglass")
         game.run("hotbar", 1)
+        game.run("chat", "/item replace entity @s weapon.mainhand with minecraft:spyglass")
+        time.sleep(0.5)
+        game.run("look", SPY_YAW, SPY_PITCH)
         game.run("mouse", "right", "down")
         time.sleep(1.0)
         seconds, lod = game.wait_filled(args.limit)
@@ -147,11 +154,17 @@ def run_distance(args, ctl, env, cwd, distance, shots):
         result["spyglass_lod"] = lod
         time.sleep(args.settle)
         result["spyglass"] = game.run("bench", args.seconds)
+        r = game.run("status").get("renderer") or {}
+        result["spyglass_renderer"] = {k: r.get(k) for k in (
+            "drawn_sections", "section_draws", "arena_bytes", "lod_levels", "drawn_far_tiles", "drawn_far_quads")}
+        print(f"  spyglass draws {r.get('drawn_far_tiles')} far tiles, {r.get('drawn_far_quads')} far quads,"
+              f" {r.get('section_draws')} draws", flush=True)
         print(f"  spyglass refined in {seconds if seconds is None else round(seconds, 1)} s,"
               f" {lod.get('active_tiles')} tiles", flush=True)
         print(frame_line("spyglass", result["spyglass"]), flush=True)
         game.run("screenshot", shots / f"lod{distance}-spyglass.png")
         game.run("mouse", "right", "up")
+        game.run("look", YAW, PITCH)
         game.wait_filled(args.limit)
 
         (a, b) = FLIGHT
