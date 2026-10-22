@@ -156,14 +156,18 @@ pub enum Overlay {
     Graph,
 }
 
-/// The farthest LOD Distance, in chunks, on integrated GPUs other than
-/// Apple's: they share the CPU's memory bandwidth, and past it far terrain
-/// costs them more frame time than it is worth.
-pub const INTEGRATED_LOD_DISTANCE: u32 = 1024;
+/// The farthest LOD Distance, in chunks, on older integrated GPUs: they
+/// share the CPU's memory bandwidth, and past it far terrain costs them more
+/// frame time than it is worth.
+pub const INTEGRATED_LOD_DISTANCE: u32 = 256;
 /// Whether `INTEGRATED_LOD_DISTANCE` applies to this adapter. Apple's GPUs
-/// are integrated too, with memory and bandwidth enough for every distance.
+/// and Intel's Arc iGPUs are integrated too, with bandwidth enough for every
+/// distance since far tiles are 16-byte face records (an Arc iGPU draws 1024
+/// chunks at 65 to 80 FPS).
 pub fn lod_capped(info: &wgpu::AdapterInfo) -> bool {
-    info.device_type == wgpu::DeviceType::IntegratedGpu && !info.name.starts_with("Apple")
+    info.device_type == wgpu::DeviceType::IntegratedGpu
+        && !info.name.starts_with("Apple")
+        && !info.name.contains("Arc")
 }
 impl Graphics {
     /// `lod_distance` as far terrain uses it on this adapter.
@@ -459,14 +463,19 @@ mod tests {
             wgpu::DeviceType::IntegratedGpu,
         );
         let m4 = adapter("Apple M4 Pro", wgpu::DeviceType::IntegratedGpu);
+        let arc = adapter(
+            "Intel(R) Arc(tm) Graphics (MTL)",
+            wgpu::DeviceType::IntegratedGpu,
+        );
         let discrete = adapter("NVIDIA GeForce RTX 4070", wgpu::DeviceType::DiscreteGpu);
-        for (distance, capped) in [(0, 0), (64, 64), (128, 128), (256, 128), (1024, 128)] {
+        for (distance, capped) in [(0, 0), (64, 64), (256, 256), (512, 256), (1024, 256)] {
             let g = Graphics {
                 lod_distance: distance,
                 ..Graphics::default()
             };
             assert_eq!(g.lod_distance_on(&hd620), capped);
             assert_eq!(g.lod_distance_on(&m4), distance);
+            assert_eq!(g.lod_distance_on(&arc), distance);
             assert_eq!(g.lod_distance_on(&discrete), distance);
         }
         assert!(

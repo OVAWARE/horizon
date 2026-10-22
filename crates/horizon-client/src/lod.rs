@@ -540,10 +540,10 @@ impl Plan {
             let factor = if previous.split.contains(&key) { 10 } else { 8 };
             let threshold = (key.size() * factor) as f32;
             let mut magnified = threshold;
-            if let Some(zoom) = zoom {
-                if zoom.sees(key, camera, height_range(key, &heights)) {
-                    magnified *= zoom.zoom;
-                }
+            if let Some(zoom) = zoom
+                && zoom.sees(key, camera, height_range(key, &heights))
+            {
+                magnified *= zoom.zoom;
             }
             let distance = distance.max(elevation).max(1) as f32;
             (threshold / distance, magnified / distance)

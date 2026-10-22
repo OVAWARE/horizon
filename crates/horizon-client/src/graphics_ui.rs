@@ -83,7 +83,7 @@ pub fn rows(level: Level) -> Vec<Row> {
     let lod = h(
         H::LodDistance,
         Medium,
-        "Coarse distant terrain in local worlds. Integrated GPUs stop at 128 chunks.",
+        "Coarse distant terrain in local worlds. Older iGPUs stop at 256 chunks.",
     );
     let fov = v(
         Opt::Fov,
