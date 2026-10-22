@@ -64,6 +64,12 @@ pub(super) struct GuestPlay {
     xp_delay: u32,
     /// What last killed the guest outright (`/kill`): the death message's key.
     death_cause: Option<String>,
+    /// The equipment modifiers on the guest's attributes (`apply_equipment`)
+    /// and the armour and main hand they were put on for: the hub's player
+    /// is a `ServerPlayer` too, whose worn armour counts
+    /// (`LivingEntity.collectEquipmentChanges`).
+    modifiers: Vec<(String, String)>,
+    equipped: Option<Vec<Option<ItemStack>>>,
 }
 
 /// A guest's command waiting for the hub (`LanHost::commands`).
@@ -130,6 +136,8 @@ pub(super) struct GuestSwap {
     swings: u32,
     /// How many projectiles there were: those added since are the guest's.
     projectiles: usize,
+    /// The host's equipment modifiers.
+    modifiers: Vec<(String, String)>,
 }
 
 impl GuestPlay {
@@ -193,15 +201,25 @@ impl Game<'_> {
             return None;
         }
         let i = host.hub.guests.iter().position(|g| g.conn == conn)?;
-        if host.hub.guests[i].motion.is_none() {
+        let fresh = host.hub.guests[i].motion.is_none();
+        if fresh {
             let p = Vec3::new(
                 host.hub.guests[i].position[0],
                 host.hub.guests[i].position[1],
                 host.hub.guests[i].position[2],
             );
             host.hub.guests[i].motion = PlayerMotion::new(self.motion, p).ok().map(Box::new);
+            let kept = host.hub.guests[i].logs_kept.take();
+            if let (Some(m), Some((hurts, attacks))) = (host.hub.guests[i].motion.as_mut(), kept) {
+                m.hurt_log = hurts;
+                m.attack_log = attacks;
+            }
         }
         let mut play = host.play.remove(&conn).unwrap_or_default();
+        if fresh {
+            // A new body (joined, respawned, changed level): nothing on it yet.
+            play.equipped = None;
+        }
         let g = &mut host.hub.guests[i];
         // The guest's body.
         let Some(mut motion) = g.motion.take() else {
@@ -305,6 +323,17 @@ impl Game<'_> {
         let packets = std::mem::take(&mut self.guest_packets);
         let swings = self.swings_started;
         let projectiles = self.creatures.projectiles.len();
+        let modifiers = std::mem::replace(
+            &mut self.applied_modifiers,
+            std::mem::take(&mut play.modifiers),
+        );
+        // Its worn armour on its attributes, when it changed.
+        let mut equipped: Vec<Option<ItemStack>> = self.armor.to_vec();
+        equipped.push(self.inventory.get(self.selected).cloned().flatten());
+        if play.equipped.as_ref() != Some(&equipped) {
+            self.apply_equipment();
+            play.equipped = Some(equipped);
+        }
         Some(GuestSwap {
             conn,
             i,
@@ -350,6 +379,7 @@ impl Game<'_> {
             packets,
             swings,
             projectiles,
+            modifiers,
         })
     }
 
@@ -401,7 +431,9 @@ impl Game<'_> {
             packets,
             swings,
             projectiles,
+            modifiers,
         } = swap;
+        play.modifiers = std::mem::replace(&mut self.applied_modifiers, modifiers);
         // What the guest shot is theirs (Projectile.setOwner).
         for p in self.creatures.projectiles.iter_mut().skip(projectiles) {
             if p.owner == Some(horizon_client::mobs::Who::Player) && p.guest.is_none() {
@@ -800,6 +832,8 @@ impl Game<'_> {
                     ],
                 };
                 let hand = if p.hand == 1 { Hand::Off } else { Hand::Main };
+                let logged = self.world.block_log.as_ref().map_or(0, Vec::len);
+                let heard = self.audio.capture.as_ref().map_or(0, Vec::len);
                 let swung = self.as_guest(host, conn, |g| {
                     g.forced_hit = Some(hit);
                     g.guest_use = Some(GuestUse::OnBlock(hand));
@@ -810,6 +844,7 @@ impl Game<'_> {
                     g.swings_started != swings
                 });
                 self.lan_swing_back(host, conn, swung);
+                self.guest_use_sounds(host, conn, logged, heard);
                 // The client predicted a result: correct it with what really is.
                 for pos in [
                     p.pos,
@@ -1122,6 +1157,22 @@ impl Game<'_> {
             }
             return;
         }
+        // A ghast's fireball or a wind charge: turned along the guest's own
+        // view (ServerGamePacketListenerImpl.handleInteract, then
+        // Player.attack's AIM_DEFLECT).
+        if let Some(i) = self
+            .creatures
+            .projectiles
+            .iter()
+            .position(|p| p.id != 0 && p.id as i32 == id && super::deflect::redirectable(p))
+        {
+            self.as_guest(host, conn, |g| {
+                if g.within_interaction_range(i) {
+                    g.deflect(i);
+                }
+            });
+            return;
+        }
         let (old_yaw, old_pitch) = (host.hub.guests[gi].yaw, host.hub.guests[gi].pitch);
         if self.look_at_entity(host, gi, id).is_none() {
             return;
@@ -1348,7 +1399,10 @@ impl Game<'_> {
         g.food = 20;
         g.saturation = 5.0;
         g.sent_health = None;
-        g.motion = None;
+        if let Some(m) = g.motion.take() {
+            let m = *m;
+            g.logs_kept = Some((m.hurt_log, m.attack_log));
+        }
         let mut xp = Experience {
             level: g.xp_level,
             progress: g.xp_progress,
@@ -1951,6 +2005,33 @@ impl Game<'_> {
                 Collector::Guest(id as u32),
                 target,
             );
+        }
+    }
+
+    /// `level.playSound(player, ...)` of a guest's use it predicted (`remote::hand_operated`
+    /// blocks only, as the guest decides): the others hear it now, the guest already did.
+    fn guest_use_sounds(&mut self, host: &mut LanHost, conn: u32, logged: usize, heard: usize) {
+        let changed: Vec<(i32, i32, i32)> = self
+            .world
+            .block_log
+            .as_ref()
+            .map_or(&[][..], |log| log.get(logged..).unwrap_or(&[]))
+            .to_vec();
+        let facts = self.res.facts();
+        if changed.is_empty()
+            || !changed.iter().all(|&(x, y, z)| {
+                super::remote::hand_operated(&facts.get(self.world.block(x, y, z)).name)
+            })
+        {
+            return;
+        }
+        let Some(capture) = self.audio.capture.as_mut() else {
+            return;
+        };
+        let sounds: Vec<_> = capture.drain(heard.min(capture.len())..).collect();
+        for (name, at, volume, pitch) in sounds {
+            let source = horizon_client::settings::sound_source(&name) as i32;
+            host.hub.sound(&name, at, volume, pitch, source, Some(conn));
         }
     }
 

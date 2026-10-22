@@ -34,6 +34,7 @@ mod crossbow;
 mod debug_keys;
 mod decorated_pot;
 mod dedicated;
+mod deflect;
 mod dispense_fixture;
 mod dispenser;
 mod dragon;
@@ -89,6 +90,7 @@ mod mob_gear;
 mod mods;
 mod mount_menu;
 mod mounts;
+mod moving_pistons;
 mod music;
 mod names;
 mod natural_spawning;
@@ -1239,7 +1241,9 @@ struct Game<'a> {
     /// swap just before an attack keeps them, with the new item's enchantments
     /// (attribute swapping).
     attack_item: Option<Arc<str>>,
-    last_hurt_by_player: HashSet<u32>,
+    /// Mobs a player hurt (`LivingEntity.lastHurtByPlayer`), with the guest
+    /// it was by connection (None: the host).
+    last_hurt_by_player: HashMap<u32, Option<u32>>,
     /// Mobs whose death (`LivingEntity.die`) has been handled.
     died: HashSet<u32>,
     /// Client-ticked block-entity animation state (`game/block_entity_anims.rs`).
@@ -2423,7 +2427,20 @@ impl Game<'_> {
             b.run_block_events(level, ticks);
             b.tick_block_entities(level, ticks);
         });
+        self.sync_moving_pistons();
         self.process_level_events()
+    }
+    /// Copies the moving-piston block entities into the world, where the
+    /// collision queries and the renderer read them.
+    fn sync_moving_pistons(&mut self) {
+        let pistons = &mut self.world.moving_pistons;
+        pistons.clear();
+        pistons.extend(
+            self.block_ticks
+                .moving_pistons
+                .iter()
+                .map(|(p, piston)| ([p.x, p.y, p.z], piston.shape_state())),
+        );
     }
     /// `ServerLevel.tick`'s scheduled block then fluid ticks, one at a time:
     /// the side effects of each (a shrieker summoning a warden, drops, game
@@ -3769,6 +3786,9 @@ impl Game<'_> {
                     f64::from(z) + 0.5,
                 ));
                 self.level.spawn = Some([f64::from(x), f64::from(y), f64::from(z)]);
+                // The world's spawn from the start, not only once saved: a bed set
+                // before the first save must not become it.
+                self.level.world_spawn.get_or_insert([x, y, z]);
             }
             let s = self
                 .level
@@ -6575,6 +6595,7 @@ impl Game<'_> {
                 vertex.color = horizon_client::hud_layout::multiply(vertex.color, tint);
             }
         }
+        self.moving_piston_geometry(camera, alpha, &mut out);
         self.tnt_geometry(camera, alpha, &mut out);
         self.painting_geometry(camera, &mut out);
         self.frame_geometry(camera, &mut out);
@@ -6586,6 +6607,7 @@ impl Game<'_> {
         self.leash_geometry(camera, alpha, &mut out);
         self.trident_geometry(camera, alpha, &mut out);
         self.rocket_geometry(camera, alpha, &mut out);
+        self.thrown_potion_geometry(camera, alpha, &mut out);
         // Particles (ParticleEngine.extract): camera-facing quads.
         let world = &self.world;
         self.particles.render(
@@ -6829,6 +6851,10 @@ impl Game<'_> {
             self.break_painting(i, true);
             return true;
         }
+        // A ghast's fireball or a wind charge in front: turned back.
+        if self.attack_redirectable() {
+            return true;
+        }
         let hand_damage = 1.0
             + self
                 .held()
@@ -6881,7 +6907,24 @@ impl Game<'_> {
             Some(f) => self.attack_source(f),
             None => horizon_client::mobs::Damage::of(horizon_client::mobs::DamageKind::Generic),
         };
-        if self.hurt_by_player(index, amount, source) {
+        let landed = self.hurt_by_player(index, amount, source);
+        if let Some(p) = self.player.as_mut() {
+            if p.attack_log.len() >= 64 {
+                p.attack_log.remove(0);
+            }
+            p.attack_log.push(horizon_client::health::AttackRecord {
+                game_time: p.health.game_time(),
+                target: target_kind.clone(),
+                id: self.mobs[index].id,
+                killed: landed && !self.mobs[index].alive(),
+                amount,
+                scale,
+                crit,
+                landed,
+                dealt: old_health - self.mobs[index].health,
+            });
+        }
+        if landed {
             if knockback > 0.0 {
                 let (xd, zd) = self.extra_knockback_direction();
                 self.mobs[index].knockback(f64::from(knockback), xd, zd);
@@ -6920,7 +6963,8 @@ impl Game<'_> {
                     (actual * 0.5) as u32,
                 );
             }
-            self.last_hurt_by_player.insert(self.mobs[index].id);
+            self.last_hurt_by_player
+                .insert(self.mobs[index].id, self.lan_acting);
             let sound = if crit {
                 "minecraft:entity.player.attack.crit"
             } else if scale > 0.9 {
@@ -9387,7 +9431,7 @@ impl Game<'_> {
             ),
         };
         self.audio
-            .set_listener([camera.x, camera.y, camera.z], view_yaw);
+            .set_listener([camera.x, camera.y, camera.z], view_yaw, view_pitch);
         let block = [
             camera.x.floor() as i32,
             camera.y.floor() as i32,
@@ -11315,7 +11359,7 @@ impl<'a> Game<'a> {
             raiding: Default::default(),
             attack_ticks: 100,
             attack_item: None,
-            last_hurt_by_player: HashSet::new(),
+            last_hurt_by_player: HashMap::new(),
             died: HashSet::new(),
             be_anims: {
                 let mut anims = horizon_client::block_entity_anim::BlockEntityAnims::default();
